@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY google_patents_crawler.py .
 COPY inpi_crawler.py .
+COPY wipo_crawler.py .
 COPY merge_logic.py .
 COPY patent_cliff.py .
 COPY celery_app.py .
