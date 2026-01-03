@@ -1,22 +1,19 @@
 """
-Pharmyrus v31.0-INPI-ENRICHMENT - EPO + Google + INPI + INPI Enrichment Layer
+Pharmyrus v32.0-WIPO - EPO + Google + INPI + INPI Enrichment + WIPO
 
 Layer 1: EPO OPS (FUNCIONANDO ✅)
 Layer 2: Google Patents Playwright (FUNCIONANDO ✅)  
 Layer 3: INPI Brazilian Direct Search (FUNCIONANDO ✅)
-Layer 4: INPI Enrichment - Complete BR data (NOVO v31.0 ✅)
+Layer 4: INPI Enrichment - Complete BR data (FUNCIONANDO ✅)
+Layer 5: WIPO PatentScope - PCT/WO Data (NOVO v32.0 ✅)
 
-🔥 v31.0 - INPI ENRICHMENT LAYER:
-✅ EPO mantido 100% (funciona perfeitamente)
-✅ Google Playwright mantido 100% (funciona perfeitamente)
-✅ INPI Direct Search mantido 100%
-✅ NOVO: INPI Enrichment Layer
-   - Processa BRs em batches de 5 para evitar timeout
-   - Enriquece TODAS as BRs com dados completos do INPI
-   - 18+ campos: título, resumo, inventores, depositantes, IPC, datas, etc
-   - Sleep entre batches para não sobrecarregar INPI
-   - Merge inteligente: combina EPO + INPI Direct + INPI Enriched
-   - Mantém dados mais completos em caso de duplicatas
+🔥 v32.0 - WIPO LAYER:
+✅ Todas camadas anteriores mantidas 100%
+✅ NOVO: WIPO PatentScope crawler isolado
+   - Busca PCT/WO com ISR + WOSA
+   - Análise de patenteabilidade completa
+   - Integração opcional via flag incluir_wo
+   - Endpoint separado para testes: /search/wipo
 """
 
 from fastapi import FastAPI, HTTPException
@@ -36,6 +33,9 @@ from google_patents_crawler import google_crawler
 
 # Import INPI Crawler Layer 3
 from inpi_crawler import inpi_crawler
+
+# Import WIPO Crawler Layer 5 (NOVO v32.0)
+from wipo_crawler import search_wipo_patents
 
 # Import Merge Logic
 from merge_logic import merge_br_patents
@@ -1144,9 +1144,46 @@ async def search_patents(request: SearchRequest, progress_callback=None):
         if progress_callback:
             progress_callback(70, f"INPI complete: {len(inpi_patents)} BR patents found")
         
+        # ===== LAYER 5: WIPO PATENTSCOPE (OPCIONAL) =====
+        wipo_patents = []
+        if request.incluir_wo:
+            if progress_callback:
+                progress_callback(72, "Searching WIPO PatentScope...")
+            
+            logger.info("🌐 LAYER 5: WIPO PatentScope (PCT/WO)")
+            
+            try:
+                wipo_patents = await search_wipo_patents(
+                    molecule=molecule,
+                    dev_codes=pubchem["dev_codes"],
+                    cas=pubchem["cas"],
+                    max_results=50,  # Limit WIPO
+                    groq_api_key=groq_key,
+                    progress_callback=lambda p, s: progress_callback(
+                        72 + int(p/10), f"WIPO: {s}"
+                    ) if progress_callback else None
+                )
+                
+                # Extract WO numbers from WIPO results
+                wipo_wos = {w['wo_number'] for w in wipo_patents if 'wo_number' in w}
+                
+                logger.info(f"   ✅ WIPO found: {len(wipo_wos)} WO patents with full data")
+                
+                # Merge with existing WOs
+                all_wos = all_wos | wipo_wos
+                
+                if progress_callback:
+                    progress_callback(80, f"WIPO complete: {len(wipo_wos)} WO patents")
+                    
+            except Exception as e:
+                logger.error(f"   ❌ WIPO search failed: {e}")
+                logger.warning("   Continuing without WIPO data...")
+        else:
+            logger.info("🌐 LAYER 5: WIPO PatentScope - SKIPPED (incluir_wo=False)")
+        
         # Get BR numbers from EPO families
         if progress_callback:
-            progress_callback(72, "Getting BR families from EPO...")
+            progress_callback(82, "Getting BR families from EPO...")
         
         logger.info("🔍 LAYER 3b: Getting BR families from EPO")
         br_patents_from_epo = []
@@ -1154,7 +1191,7 @@ async def search_patents(request: SearchRequest, progress_callback=None):
             if i % 20 == 0 and i > 0:
                 logger.info(f"   Getting families {i}/100...")
                 if progress_callback:
-                    progress_callback(72 + int(i/100 * 8), f"Processing WO families {i}/100...")
+                    progress_callback(82 + int(i/100 * 8), f"Processing WO families {i}/100...")
             family_patents = await get_family_patents(client, token, wo, target_countries)
             if "BR" in family_patents:
                 br_patents_from_epo.extend(family_patents["BR"])
@@ -1164,7 +1201,7 @@ async def search_patents(request: SearchRequest, progress_callback=None):
         logger.info(f"   ✅ Found {len(br_numbers)} BRs from EPO families")
         
         if progress_callback:
-            progress_callback(80, f"Found {len(br_numbers)} BRs from EPO families")
+            progress_callback(90, f"Found {len(br_numbers)} BRs from EPO families")
         
         # MERGE: EPO BRs + INPI direct (before enrichment)
         logger.info("🔀 MERGE: Combining BR sources (before INPI enrichment)")
@@ -1470,10 +1507,12 @@ async def search_patents(request: SearchRequest, progress_callback=None):
                     "by_source": {
                         "EPO": len(patents_by_source["EPO"]),
                         "INPI": len(patents_by_source["INPI"]),
-                        "Google Patents": len(patents_by_source["Google Patents"])
+                        "Google Patents": len(patents_by_source["Google Patents"]),
+                        "WIPO": len(wipo_patents)
                     },
                     "epo_wos": len(epo_wos),
                     "google_wos": len(google_wos),
+                    "wipo_wos": len(wipo_patents),
                     "inpi_direct_brs": len(inpi_patents),
                     "merged_unique_patents": len(all_patents)
                 },
@@ -1487,10 +1526,13 @@ async def search_patents(request: SearchRequest, progress_callback=None):
                         "wo_number": wo,
                         "link_espacenet": f"https://worldwide.espacenet.com/patent/search?q=pn%3D{wo}",
                         "link_google_patents": f"https://patents.google.com/patent/{wo}",
-                        "source": "EPO" if wo in epo_wos else "Google Patents"
+                        "link_wipo": f"https://patentscope.wipo.int/search/en/detail.jsf?docId={wo}",
+                        "source": "EPO" if wo in epo_wos else ("WIPO" if wo in {w.get('wo_number') for w in wipo_patents} else "Google Patents")
                     }
                     for wo in sorted(list(all_wos))
                 ],
+                
+                "wipo_detailed_patents": wipo_patents,  # ✅ NOVO v32.0: WIPO complete data
                 
                 "patents_by_country": patents_by_country,
                 "all_patents": all_patents
@@ -1701,9 +1743,67 @@ async def health_check():
     
     return {
         "status": "healthy" if redis_status == "connected" else "degraded",
-        "version": "v31.0.3-ASYNC",
+        "version": "v32.0-WIPO",
         "redis": redis_status,
         "timestamp": datetime.now().isoformat()
+    }
+
+
+# ============================================================================
+# WIPO TEST ENDPOINT - Isolated testing
+# ============================================================================
+
+@app.post("/search/wipo")
+async def search_wipo_endpoint(request: SearchRequest):
+    """
+    🌐 WIPO-only search endpoint for isolated testing
+    
+    Tests WIPO PatentScope crawler independently before full integration
+    
+    Example:
+    ```json
+    {
+        "nome_molecula": "darolutamide",
+        "nome_comercial": "Nubeqa",
+        "paises_alvo": ["BR"],
+        "incluir_wo": true
+    }
+    ```
+    """
+    logger.info(f"🌐 WIPO-only search: {request.nome_molecula}")
+    
+    start_time = datetime.now()
+    
+    # Get molecule intelligence
+    async with httpx.AsyncClient() as client:
+        pubchem = await get_pubchem_data(client, request.nome_molecula)
+    
+    # Search WIPO
+    wipo_results = await search_wipo_patents(
+        molecule=request.nome_molecula,
+        dev_codes=pubchem["dev_codes"],
+        cas=pubchem["cas"],
+        max_results=50,
+        groq_api_key=GROQ_API_KEY if 'GROQ_API_KEY' in globals() else None
+    )
+    
+    elapsed = (datetime.now() - start_time).total_seconds()
+    
+    return {
+        "metadata": {
+            "molecule_name": request.nome_molecula,
+            "brand_name": request.nome_comercial,
+            "search_date": datetime.now().isoformat(),
+            "elapsed_seconds": round(elapsed, 2),
+            "version": "v32.0-WIPO",
+            "source": "WIPO PatentScope only"
+        },
+        "wipo_patents": wipo_results,
+        "summary": {
+            "total_wipo_patents": len(wipo_results),
+            "pubchem_dev_codes": len(pubchem["dev_codes"]),
+            "pubchem_cas": pubchem["cas"]
+        }
     }
 
 
