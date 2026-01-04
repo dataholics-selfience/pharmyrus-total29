@@ -1,599 +1,518 @@
 """
-WIPO PatentScope Crawler - Isolated Layer
-Resilient crawler for WIPO patent data extraction
+WIPO PatentScope Crawler V3 - Production Grade
+===============================================
 
-CRITICAL: This is an ISOLATED layer - does NOT modify existing functionality
-Ready for integration into async pipeline
+Baseado em análise real do DOM dinâmico WIPO (JSF/PrimeFaces)
+Testado com WO2019028689 - HTML completo e screenshot validados
+
+ARQUITETURA:
+- Playwright para garantir JSF render completo
+- BeautifulSoup para parsing resiliente baseado em labels
+- Contextos isolados por WO (sem travamento)
+- Timeout garantido em cada etapa
+- Logs detalhados de falhas reais
+
+ESTRUTURA DOM REAL IDENTIFICADA:
+<div class="ps-field ps-biblio-field">
+    <span class="ps-field--label">Publication Number</span>
+    <span class="ps-field--value">WO/2019/028689</span>
+</div>
+
+DADOS DISPONÍVEIS (confirmados no HTML):
+- Publication Number, Publication Date
+- International Application No., International Filing Date
+- IPC, CPC
+- Applicants, Inventors
+- Title, Abstract
+- Priority Data, Agents
 """
 
 import asyncio
-import json
+import httpx
 import logging
-import re
 from typing import List, Dict, Optional, Any
-from playwright.async_api import async_playwright, Browser, Page, BrowserContext
-import random
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+import re
 
+# Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("wipo_crawler")
+logger = logging.getLogger("wipo_v3")
 
+# ============================================================================
+# CONSTANTS
+# ============================================================================
 
-class WIPOCrawler:
+BASE_URL = "https://patentscope.wipo.int"
+SEARCH_URL = f"{BASE_URL}/search/en/result.jsf"
+DETAIL_URL = f"{BASE_URL}/search/en/detail.jsf"
+
+# Timeouts (ms)
+PAGE_TIMEOUT = 45000  # 45s max por página
+NAVIGATION_TIMEOUT = 30000  # 30s para goto
+NETWORKIDLE_TIMEOUT = 5000  # 5s após último request
+
+# ============================================================================
+# STEP 1: SEARCH WO NUMBERS (HTTPX - FAST)
+# ============================================================================
+
+async def search_wipo_wo_numbers(molecule: str, dev_codes: List[str] = None, 
+                                  cas: str = None, max_results: int = 50) -> List[str]:
     """
-    WIPO PatentScope crawler - isolated, resilient implementation
-    Based on HTML samples and navigation guide
+    Busca WO numbers via HTTPX (não precisa Playwright)
+    
+    Retorna: Lista de WO numbers (ex: ['WO2019028689', 'WO2018036558'])
     """
+    query_parts = [molecule]
+    if dev_codes:
+        query_parts.extend(dev_codes[:3])
+    if cas:
+        query_parts.append(cas)
     
-    BASE_URL = "https://patentscope.wipo.int"
+    query = " OR ".join(query_parts)
+    logger.info(f"🔍 WIPO search query: {query}")
     
-    # Proxies pool (from existing system)
-    PROXIES = [
-        # Add your proxy list here
-        # Format: {"server": "http://proxy:port", "username": "user", "password": "pass"}
-    ]
+    params = {"query": f"FP:({query})"}
     
-    def __init__(self, groq_api_key: Optional[str] = None, use_proxies: bool = True):
-        """
-        Initialize WIPO crawler
-        
-        Args:
-            groq_api_key: Groq API key for dynamic element identification
-            use_proxies: Whether to use proxy rotation
-        """
-        self.groq_api_key = groq_api_key
-        self.use_proxies = use_proxies
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        
-    async def __aenter__(self):
-        """Async context manager entry"""
-        await self.start()
-        return self
-        
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        await self.close()
-        
-    async def start(self):
-        """Start browser with stealth configuration"""
-        playwright = await async_playwright().start()
-        
-        # Stealth configuration (same as existing Google crawler)
-        launch_args = [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-dev-shm-usage',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-web-security',
-            '--disable-features=IsolateOrigins,site-per-process'
-        ]
-        
-        self.browser = await playwright.chromium.launch(
-            headless=True,
-            args=launch_args
-        )
-        
-        # Create context with stealth
-        context_options = {
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'viewport': {'width': 1920, 'height': 1080},
-            'locale': 'en-US',
-            'timezone_id': 'America/New_York'
-        }
-        
-        # Add proxy if enabled
-        if self.use_proxies and self.PROXIES:
-            proxy = random.choice(self.PROXIES)
-            context_options['proxy'] = proxy
-            
-        self.context = await self.browser.new_context(**context_options)
-        
-        # Inject stealth scripts
-        await self.context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-        """)
-        
-        logger.info("✅ WIPO Crawler initialized with stealth mode")
-        
-    async def close(self):
-        """Close browser"""
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-            
-    async def search_wipo(
-        self,
-        query: str,
-        max_results: int = 200,
-        progress_callback: Optional[callable] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Search WIPO PatentScope and extract WO patents
-        
-        Args:
-            query: Search query (molecule name, dev codes, etc)
-            max_results: Maximum results to retrieve (max 200 per page)
-            progress_callback: Optional callback for progress updates
-            
-        Returns:
-            List of WO patent data dictionaries
-        """
-        if not self.context:
-            await self.start()
-            
-        logger.info(f"🔍 Searching WIPO for: {query}")
-        
-        # Step 1: Perform search
-        search_url = f"{self.BASE_URL}/search/en/result.jsf?query=FP:({query})"
-        
-        page = await self.context.new_page()
-        
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         try:
-            # Navigate to search results
-            await page.goto(search_url, wait_until='networkidle', timeout=60000)
-            await asyncio.sleep(random.uniform(2, 4))
+            response = await client.get(SEARCH_URL, params=params)
+            response.raise_for_status()
             
-            # Step 2: Set 200 results per page
-            await self._set_results_per_page(page, max_results)
+            # Parse HTML simples para pegar WO numbers
+            soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Step 3: Extract WO numbers from results
-            wo_numbers = await self._extract_wo_numbers(page)
-            
-            logger.info(f"   Found {len(wo_numbers)} WO patents")
-            
-            if progress_callback:
-                progress_callback(5, f"Found {len(wo_numbers)} WO patents")
-            
-            # Step 4: Process each WO patent
-            patents_data = []
-            total = len(wo_numbers)
-            
-            for idx, wo_number in enumerate(wo_numbers[:max_results], 1):
-                try:
-                    if progress_callback and idx % 10 == 0:
-                        progress = 5 + int((idx / total) * 15)  # 5-20% range
-                        progress_callback(progress, f"Processing WO {idx}/{total}")
-                    
-                    logger.info(f"   Processing {wo_number} ({idx}/{total})")
-                    
-                    patent_data = await self._extract_patent_data(page, wo_number)
-                    if patent_data:
-                        patents_data.append(patent_data)
-                    
-                    # Rate limiting
-                    await asyncio.sleep(random.uniform(1, 2))
-                    
-                except Exception as e:
-                    logger.error(f"   ❌ Error processing {wo_number}: {e}")
-                    continue
-                    
-            await page.close()
-            
-            logger.info(f"✅ WIPO search complete: {len(patents_data)} patents extracted")
-            return patents_data
-            
-        except Exception as e:
-            logger.error(f"❌ WIPO search failed: {e}")
-            await page.close()
-            return []
-            
-    async def _set_results_per_page(self, page: Page, count: int = 200):
-        """
-        Set number of results per page
-        Based on: 2 - 200 resultados.html
-        """
-        try:
-            # Wait for per-page selector
-            await page.wait_for_selector('label.ps-plain-select--label:has-text("Per page")', timeout=10000)
-            
-            # Click on dropdown
-            await page.click('label.ps-plain-select--label:has-text("Per page")')
-            await asyncio.sleep(1)
-            
-            # Select 200 results option
-            await page.click(f'text="{count}"')
-            await asyncio.sleep(2)
-            
-            logger.info(f"   ✅ Set {count} results per page")
-            
-        except Exception as e:
-            logger.warning(f"   ⚠️  Could not set results per page: {e}")
-            
-    async def _extract_wo_numbers(self, page: Page) -> List[str]:
-        """
-        Extract WO numbers from search results
-        Based on: 2 - 200 resultados.html
-        Pattern: <span class="notranslate ps-patent-result--title--patent-number">WO/2022/049075</span>
-        """
-        try:
-            # Wait for results
-            await page.wait_for_selector('.ps-patent-result--title--patent-number', timeout=10000)
-            
-            # Extract all WO numbers
-            wo_elements = await page.query_selector_all('.ps-patent-result--title--patent-number')
-            
+            # WO numbers aparecem em links como: /search/en/detail.jsf?docId=WO2019028689
             wo_numbers = []
-            for element in wo_elements:
-                text = await element.text_content()
-                if text and 'WO' in text:
-                    # Normalize: WO/2022/049075 -> WO2022049075
-                    wo_clean = text.replace('/', '').strip()
-                    wo_numbers.append(wo_clean)
-                    
+            for link in soup.find_all('a', href=True):
+                if 'detail.jsf?docId=' in link['href']:
+                    match = re.search(r'docId=(WO\d{4}\d{6})', link['href'])
+                    if match:
+                        wo_numbers.append(match.group(1))
+            
+            # Remove duplicatas e limita
+            wo_numbers = list(dict.fromkeys(wo_numbers))[:max_results]
+            
+            logger.info(f"✅ Found {len(wo_numbers)} WO patents")
             return wo_numbers
             
         except Exception as e:
-            logger.error(f"   ❌ Failed to extract WO numbers: {e}")
+            logger.error(f"❌ Search failed: {e}")
             return []
-            
-    async def _extract_patent_data(self, page: Page, wo_number: str) -> Optional[Dict[str, Any]]:
-        """
-        Extract complete patent data for a WO number
-        Navigates through all tabs: Biblio, Description, Claims, ISR, WOSA
-        """
-        try:
-            # Click on WO number in results
-            await page.click(f'text="{wo_number}"')
-            await page.wait_for_load_state('networkidle', timeout=30000)
-            await asyncio.sleep(2)
-            
-            patent_data = {
-                'wo_number': wo_number,
-                'source': 'WIPO',
-                'biblio_data': {},
-                'description': None,
-                'claims': [],
-                'isr_data': {},
-                'wosa_data': {}
-            }
-            
-            # TAB 1: PCT Biblio Data (default tab)
-            patent_data['biblio_data'] = await self._extract_biblio_data(page)
-            
-            # TAB 2: Description
-            try:
-                await page.click('a:has-text("Description")')
-                await asyncio.sleep(2)
-                patent_data['description'] = await self._extract_description(page)
-            except:
-                logger.warning(f"   ⚠️  No Description tab for {wo_number}")
-                
-            # TAB 3: Claims
-            try:
-                await page.click('a:has-text("Claims")')
-                await asyncio.sleep(2)
-                patent_data['claims'] = await self._extract_claims(page)
-            except:
-                logger.warning(f"   ⚠️  No Claims tab for {wo_number}")
-                
-            # TAB 4: ISR/WOSA
-            try:
-                await page.click('a:has-text("ISR/WOSA")')
-                await asyncio.sleep(2)
-                
-                # Extract ISR
-                patent_data['isr_data'] = await self._extract_isr(page)
-                
-                # Click on WOSA sub-tab
-                try:
-                    await page.click('a:has-text("Written Opinion")')
-                    await asyncio.sleep(2)
-                    patent_data['wosa_data'] = await self._extract_wosa(page)
-                except:
-                    logger.warning(f"   ⚠️  No WOSA data for {wo_number}")
-                    
-            except:
-                logger.warning(f"   ⚠️  No ISR/WOSA tab for {wo_number}")
-                
-            # Navigate back to results
-            await page.go_back()
-            await asyncio.sleep(1)
-            
-            return patent_data
-            
-        except Exception as e:
-            logger.error(f"   ❌ Failed to extract data for {wo_number}: {e}")
-            return None
-            
-    async def _extract_biblio_data(self, page: Page) -> Dict[str, Any]:
-        """
-        Extract bibliographic data from PCT Biblio tab
-        Based on: 4.1 - PCT Biblio. Data.html
-        """
-        biblio = {}
-        
-        try:
-            # Extract structured fields
-            fields_map = {
-                'Publication Number': 'publication_number',
-                'Publication Date': 'publication_date',
-                'International Application No.': 'application_number',
-                'International Filing Date': 'filing_date',
-                'IPC': 'ipc_codes',
-                'CPC': 'cpc_codes',
-                'Publication Language': 'publication_language',
-                'Filing Language': 'filing_language'
-            }
-            
-            for label, key in fields_map.items():
-                try:
-                    value = await page.locator(f'text="{label}"').locator('..').inner_text()
-                    biblio[key] = value.replace(label, '').strip()
-                except:
-                    pass
-                    
-            # Applicants
-            try:
-                applicants_text = await page.locator('text="Applicants"').locator('..').inner_text()
-                biblio['applicants'] = [a.strip() for a in applicants_text.split('\n') if a.strip() and a.strip() != 'Applicants']
-            except:
-                biblio['applicants'] = []
-                
-            # Inventors
-            try:
-                inventors_text = await page.locator('text="Inventors"').locator('..').inner_text()
-                biblio['inventors'] = [i.strip() for i in inventors_text.split('\n') if i.strip() and i.strip() != 'Inventors']
-            except:
-                biblio['inventors'] = []
-                
-            # Title
-            try:
-                title_elem = await page.query_selector('text="Title"')
-                if title_elem:
-                    parent = await title_elem.evaluate_handle('el => el.parentElement')
-                    title_text = await parent.inner_text()
-                    # Extract EN title
-                    match = re.search(r'\(EN\)\s*(.+?)(?:\(FR\)|$)', title_text, re.DOTALL)
-                    if match:
-                        biblio['title'] = match.group(1).strip()
-            except:
-                pass
-                
-            # Abstract
-            try:
-                abstract_elem = await page.query_selector('text="Abstract"')
-                if abstract_elem:
-                    parent = await abstract_elem.evaluate_handle('el => el.parentElement')
-                    abstract_text = await parent.inner_text()
-                    # Extract EN abstract
-                    match = re.search(r'\(EN\)\s*(.+?)(?:\(FR\)|$)', abstract_text, re.DOTALL)
-                    if match:
-                        biblio['abstract'] = match.group(1).strip()
-            except:
-                pass
-                
-            # Priority Data
-            try:
-                priority_section = await page.locator('text="Priority Data"').locator('..').inner_text()
-                biblio['priority_data'] = priority_section.replace('Priority Data', '').strip()
-            except:
-                pass
-                
-        except Exception as e:
-            logger.warning(f"   ⚠️  Error extracting biblio data: {e}")
-            
-        return biblio
-        
-    async def _extract_description(self, page: Page) -> Optional[str]:
-        """
-        Extract description (FAST mode - summary only)
-        Based on: 4.2 - Description.html
-        
-        Only extract:
-        - Technical field
-        - Summary
-        - Key examples
-        """
-        try:
-            # Get first 5000 chars as summary
-            desc_container = await page.query_selector('.ps-patent-detail-content')
-            if desc_container:
-                full_text = await desc_container.inner_text()
-                # Take first 5000 chars
-                return full_text[:5000] if full_text else None
-            return None
-        except:
-            return None
-            
-    async def _extract_claims(self, page: Page) -> List[Dict[str, Any]]:
-        """
-        Extract claims with independent/dependent classification
-        Based on: 5 - Claims.html
-        """
-        claims = []
-        
-        try:
-            # Claims are typically numbered
-            claim_elements = await page.query_selector_all('.claim')
-            
-            for elem in claim_elements:
-                try:
-                    text = await elem.inner_text()
-                    
-                    # Detect claim number
-                    match = re.match(r'^(\d+)\.\s*', text)
-                    if match:
-                        claim_num = int(match.group(1))
-                        claim_text = text[match.end():].strip()
-                        
-                        # Classify as independent or dependent
-                        is_dependent = bool(re.search(r'claim\s+\d+', claim_text, re.IGNORECASE))
-                        
-                        claims.append({
-                            'claim_number': claim_num,
-                            'claim_type': 'dependent' if is_dependent else 'independent',
-                            'claim_text': claim_text
-                        })
-                except:
-                    continue
-                    
-        except Exception as e:
-            logger.warning(f"   ⚠️  Error extracting claims: {e}")
-            
-        return claims
-        
-    async def _extract_isr(self, page: Page) -> Dict[str, Any]:
-        """
-        Extract International Search Report data
-        Based on: 4.3.1 - ISR.html
-        
-        Focus on:
-        - Citation documents (D1, D2, etc)
-        - Categories (X, Y, etc)
-        """
-        isr_data = {
-            'citations': [],
-            'search_fields': None
-        }
-        
-        try:
-            # Extract citation table
-            rows = await page.query_selector_all('table tr')
-            
-            for row in rows:
-                try:
-                    cells = await row.query_selector_all('td')
-                    if len(cells) >= 2:
-                        category = await cells[0].inner_text()
-                        citation = await cells[1].inner_text()
-                        
-                        isr_data['citations'].append({
-                            'category': category.strip(),
-                            'document': citation.strip()
-                        })
-                except:
-                    continue
-                    
-        except Exception as e:
-            logger.warning(f"   ⚠️  Error extracting ISR: {e}")
-            
-        return isr_data
-        
-    async def _extract_wosa(self, page: Page) -> Dict[str, Any]:
-        """
-        Extract Written Opinion of ISA
-        Based on: 4.3.3 - WOSA.html
-        
-        Focus on:
-        - Novelty, Inventive Step, Industrial Applicability per claim
-        - Examiner conclusions
-        """
-        wosa_data = {
-            'novelty': {},
-            'inventive_step': {},
-            'industrial_applicability': {},
-            'conclusions': []
-        }
-        
-        try:
-            # Look for Box No. V table
-            content = await page.inner_text('body')
-            
-            # Extract novelty assessment
-            novelty_match = re.search(r'Novelty \(N\)\s+Claims\s+([\d\-,\s]+)\s+YES', content)
-            if novelty_match:
-                wosa_data['novelty']['yes_claims'] = novelty_match.group(1).strip()
-                
-            novelty_no_match = re.search(r'Novelty \(N\)\s+Claims\s+([\d\-,\s]+)\s+NO', content)
-            if novelty_no_match:
-                wosa_data['novelty']['no_claims'] = novelty_no_match.group(1).strip()
-                
-            # Extract inventive step
-            is_match = re.search(r'Inventive step \(IS\)\s+Claims\s+([\d\-,\s]+)\s+NO', content)
-            if is_match:
-                wosa_data['inventive_step']['no_claims'] = is_match.group(1).strip()
-                
-            # Extract main conclusions (first 1000 chars of reasoned statement)
-            conclusion_match = re.search(r'Reasoned statement(.{0,1000})', content, re.DOTALL)
-            if conclusion_match:
-                wosa_data['conclusions'] = conclusion_match.group(1).strip()
-                
-        except Exception as e:
-            logger.warning(f"   ⚠️  Error extracting WOSA: {e}")
-            
-        return wosa_data
 
 
-# =========================
-# INTEGRATION FUNCTION
-# =========================
+# ============================================================================
+# STEP 2: FETCH DETAIL PAGE (PLAYWRIGHT - JSF DYNAMIC)
+# ============================================================================
+
+async def fetch_detail_html(wo_number: str, headless: bool = True) -> Optional[str]:
+    """
+    Carrega página de detalhe via Playwright e retorna HTML final
+    
+    CRÍTICO:
+    - JSF leva ~25s para carregar completamente
+    - Usa contexto isolado (não contamina entre WOs)
+    - Timeout garantido (não trava)
+    
+    Retorna: HTML completo ou None se falhar
+    """
+    url = f"{DETAIL_URL}?docId={wo_number}"
+    
+    try:
+        async with async_playwright() as p:
+            # Contexto isolado para este WO
+            browser = await p.chromium.launch(headless=headless)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = await context.new_page()
+            
+            # Timeout global da página
+            page.set_default_timeout(PAGE_TIMEOUT)
+            
+            try:
+                # Navigate
+                logger.info(f"  Loading {wo_number}...")
+                await page.goto(url, timeout=NAVIGATION_TIMEOUT, wait_until="domcontentloaded")
+                
+                # Esperar network idle (JSF faz múltiplos AJAX)
+                # IMPORTANTE: Não usar como única condição!
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+                except PlaywrightTimeout:
+                    logger.warning(f"  {wo_number}: networkidle timeout, continuing...")
+                
+                # Esperar dado crítico aparecer (fallback robusto)
+                # Se "Publication Number" não aparecer em 10s, desiste
+                try:
+                    await page.wait_for_selector(
+                        'text="Publication Number"',
+                        timeout=10000
+                    )
+                except PlaywrightTimeout:
+                    logger.error(f"  {wo_number}: Publication Number never appeared!")
+                    await browser.close()
+                    return None
+                
+                # Pegar HTML final
+                html = await page.content()
+                await browser.close()
+                
+                logger.info(f"  ✅ HTML loaded: {len(html)} chars")
+                return html
+                
+            except PlaywrightTimeout as e:
+                logger.error(f"  ❌ Timeout loading {wo_number}: {e}")
+                await browser.close()
+                return None
+                
+            except Exception as e:
+                logger.error(f"  ❌ Error loading {wo_number}: {e}")
+                await browser.close()
+                return None
+                
+    except Exception as e:
+        logger.error(f"❌ Playwright init failed for {wo_number}: {e}")
+        return None
+
+
+# ============================================================================
+# STEP 3: PARSE BIBLIO DATA (BEAUTIFULSOUP - LABEL-BASED)
+# ============================================================================
+
+def extract_field_by_label(soup: BeautifulSoup, label_text: str) -> Optional[str]:
+    """
+    Extrai valor de campo baseado no label (estrutura semântica)
+    
+    Estrutura esperada:
+    <div class="ps-field ps-biblio-field">
+        <span class="ps-field--label">Publication Number</span>
+        <span class="ps-field--value">WO/2019/028689</span>
+    </div>
+    
+    RESILIENTE:
+    - Busca por texto do label, não por ID/classe específica
+    - Sobe na árvore DOM até achar container
+    - Desce para pegar value
+    """
+    try:
+        # Buscar label
+        label = soup.find('span', class_='ps-field--label', string=re.compile(label_text, re.IGNORECASE))
+        if not label:
+            return None
+        
+        # Subir para div container
+        field_div = label.find_parent('div', class_='ps-field')
+        if not field_div:
+            return None
+        
+        # Pegar value (span seguinte)
+        value_span = field_div.find('span', class_='ps-field--value')
+        if not value_span:
+            return None
+        
+        # Extrair texto limpo
+        text = value_span.get_text(strip=True, separator=' ')
+        return text if text else None
+        
+    except Exception as e:
+        logger.debug(f"Field '{label_text}' extraction failed: {e}")
+        return None
+
+
+def extract_list_field(soup: BeautifulSoup, label_text: str) -> List[str]:
+    """
+    Extrai campos de lista (Applicants, Inventors)
+    
+    Estrutura real:
+    <span class="ps-field--value">
+        <span class="patent-person">
+            <ul class="biblio-person-list">
+                <li>
+                    <span class="biblio-person-list--name">NAME</span>
+                </li>
+            </ul>
+        </span>
+    </span>
+    """
+    try:
+        label = soup.find('span', class_='ps-field--label', string=re.compile(label_text, re.IGNORECASE))
+        if not label:
+            return []
+        
+        field_div = label.find_parent('div', class_='ps-field')
+        if not field_div:
+            return []
+        
+        # Pegar lista de pessoas
+        person_list = field_div.find('ul', class_='biblio-person-list')
+        if not person_list:
+            return []
+        
+        names = []
+        for li in person_list.find_all('li'):
+            name_span = li.find('span', class_='biblio-person-list--name')
+            if name_span:
+                name = name_span.get_text(strip=True)
+                if name:
+                    names.append(name)
+        
+        return names
+        
+    except Exception as e:
+        logger.debug(f"List field '{label_text}' extraction failed: {e}")
+        return []
+
+
+def extract_ipc_codes(soup: BeautifulSoup) -> List[str]:
+    """
+    Extrai códigos IPC
+    
+    Estrutura:
+    <div class="patent-classification">
+        <a href="...">C07D 231/14</a>
+        <span>2006.1</span>
+    </div>
+    """
+    try:
+        ipc_codes = []
+        
+        # Buscar label IPC
+        label = soup.find('span', class_='ps-field--label', string=re.compile('IPC', re.IGNORECASE))
+        if not label:
+            return []
+        
+        field_div = label.find_parent('div', class_='ps-field')
+        if not field_div:
+            return []
+        
+        # Pegar todos os classification divs
+        for classification in field_div.find_all('div', class_='patent-classification'):
+            link = classification.find('a')
+            if link:
+                code = link.get_text(strip=True)
+                if code:
+                    ipc_codes.append(code)
+        
+        return ipc_codes
+        
+    except Exception as e:
+        logger.debug(f"IPC extraction failed: {e}")
+        return []
+
+
+def parse_biblio_data(html: str, wo_number: str) -> Dict[str, Any]:
+    """
+    Parser principal - extrai todos os campos bibliográficos
+    
+    RESILIENTE:
+    - Se campo não existir, retorna None/[]
+    - Nunca lança exceção fatal
+    - Sempre retorna dict (mesmo que vazio)
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    data = {
+        "wo_number": wo_number,
+        "source": "WIPO",
+        "extraction_successful": False,
+        "biblio_data": {}
+    }
+    
+    try:
+        # Campos simples
+        pub_number = extract_field_by_label(soup, "Publication Number")
+        pub_date = extract_field_by_label(soup, "Publication Date")
+        app_number = extract_field_by_label(soup, "International Application No")
+        filing_date = extract_field_by_label(soup, "International Filing Date")
+        title = extract_field_by_label(soup, "Title")
+        abstract = extract_field_by_label(soup, "Abstract")
+        priority = extract_field_by_label(soup, "Priority Data")
+        
+        # Campos de lista
+        applicants = extract_list_field(soup, "Applicants")
+        inventors = extract_list_field(soup, "Inventors")
+        
+        # IPC codes
+        ipc_codes = extract_ipc_codes(soup)
+        
+        # CPC codes (mesma estrutura que IPC)
+        cpc_codes = extract_ipc_codes(soup) if 'CPC' in html else []
+        
+        # Montar biblio_data
+        data["biblio_data"] = {
+            "publication_number": pub_number,
+            "publication_date": pub_date,
+            "application_number": app_number,
+            "filing_date": filing_date,
+            "title": title,
+            "abstract": abstract,
+            "applicants": applicants,
+            "inventors": inventors,
+            "ipc_codes": ipc_codes,
+            "cpc_codes": cpc_codes,
+            "priority_data": priority
+        }
+        
+        # Considerar sucesso se tiver pelo menos pub_number e title
+        if pub_number and title:
+            data["extraction_successful"] = True
+            logger.info(f"  ✅ Extracted: {pub_number} - {title[:50]}...")
+        else:
+            logger.warning(f"  ⚠️  Partial extraction: pub_number={pub_number}, title={bool(title)}")
+        
+    except Exception as e:
+        logger.error(f"  ❌ Parsing failed for {wo_number}: {e}")
+    
+    return data
+
+
+# ============================================================================
+# STEP 4: PROCESS WO (ISOLATED + SAFE)
+# ============================================================================
+
+async def process_wo_safe(wo_number: str, headless: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Processa um WO de forma isolada e segura
+    
+    GARANTIAS:
+    - Timeout máximo: 60s
+    - Nunca trava o loop
+    - Sempre retorna (sucesso ou None)
+    - Logs claros do motivo de falha
+    """
+    try:
+        # Timeout total para este WO
+        result = await asyncio.wait_for(
+            _process_wo_internal(wo_number, headless),
+            timeout=60.0
+        )
+        return result
+        
+    except asyncio.TimeoutError:
+        logger.error(f"❌ {wo_number}: TIMEOUT TOTAL (60s)")
+        return None
+    except Exception as e:
+        logger.error(f"❌ {wo_number}: Unexpected error: {e}")
+        return None
+
+
+async def _process_wo_internal(wo_number: str, headless: bool) -> Optional[Dict[str, Any]]:
+    """Internal processing (chamado via wait_for)"""
+    
+    # Step 1: Fetch HTML
+    html = await fetch_detail_html(wo_number, headless=headless)
+    if not html:
+        logger.error(f"  ❌ Failed to fetch HTML for {wo_number}")
+        return None
+    
+    # Step 2: Parse
+    data = parse_biblio_data(html, wo_number)
+    
+    if not data["extraction_successful"]:
+        logger.error(f"  ❌ Failed to extract data from {wo_number}")
+        # Salvar HTML para debug (opcional)
+        # with open(f"debug_{wo_number}.html", "w") as f:
+        #     f.write(html)
+        return None
+    
+    return data
+
+
+# ============================================================================
+# MAIN API FUNCTION
+# ============================================================================
 
 async def search_wipo_patents(
     molecule: str,
     dev_codes: List[str] = None,
     cas: str = None,
-    max_results: int = 100,
+    max_results: int = 50,
     groq_api_key: str = None,
-    progress_callback: callable = None
+    progress_callback = None,
+    headless: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Main integration function for WIPO search
-    ISOLATED - ready to plug into existing pipeline
+    API Principal do crawler WIPO
     
     Args:
-        molecule: Molecule name
-        dev_codes: Development codes
-        cas: CAS number
-        max_results: Max results to retrieve
-        groq_api_key: Groq API key for resilient extraction
-        progress_callback: Progress callback function
-        
+        molecule: Nome da molécula
+        dev_codes: Códigos de desenvolvimento
+        cas: Número CAS
+        max_results: Máximo de WOs para processar
+        groq_api_key: (não usado nesta versão, reservado)
+        progress_callback: Função para reportar progresso
+        headless: Modo headless do Playwright
+    
     Returns:
-        List of WO patent dictionaries
+        Lista de dicts com dados completos de cada patente
     """
-    # Build query
-    query_parts = [molecule]
-    if dev_codes:
-        query_parts.extend(dev_codes[:5])  # Limit to 5 dev codes
-    if cas:
-        query_parts.append(cas)
-        
-    query = ' OR '.join(query_parts)
+    logger.info(f"🌐 WIPO V3 search: {molecule}")
     
-    logger.info(f"🌐 WIPO search initiated: {query}")
+    # Step 1: Search WO numbers
+    if progress_callback:
+        progress_callback(0, "Searching WIPO...")
     
-    async with WIPOCrawler(groq_api_key=groq_api_key) as crawler:
-        results = await crawler.search_wipo(
-            query=query,
-            max_results=max_results,
-            progress_callback=progress_callback
-        )
+    wo_numbers = await search_wipo_wo_numbers(molecule, dev_codes, cas, max_results)
+    
+    if not wo_numbers:
+        logger.warning("No WO patents found")
+        return []
+    
+    # Limitar processamento
+    wo_numbers = wo_numbers[:max_results]
+    total = len(wo_numbers)
+    
+    logger.info(f"📄 Processing {total} WO patents...")
+    
+    # Step 2: Process each WO (isolated)
+    results = []
+    for i, wo_number in enumerate(wo_numbers, 1):
+        logger.info(f"[{i}/{total}] Processing {wo_number}...")
         
-    logger.info(f"✅ WIPO search complete: {len(results)} WO patents")
+        if progress_callback:
+            progress_pct = int((i / total) * 100)
+            progress_callback(progress_pct, f"Processing {wo_number} ({i}/{total})")
+        
+        # Processar de forma isolada e segura
+        data = await process_wo_safe(wo_number, headless=headless)
+        
+        if data:
+            results.append(data)
+        
+        # Small delay entre WOs (respeito ao servidor)
+        if i < total:
+            await asyncio.sleep(1)
+    
+    logger.info(f"✅ WIPO V3 complete: {len(results)}/{total} patents extracted")
     
     return results
 
 
-# =========================
+# ============================================================================
 # STANDALONE TEST
-# =========================
+# ============================================================================
 
-async def test_wipo_crawler():
-    """Test WIPO crawler standalone"""
-    
-    print("🧪 Testing WIPO Crawler...")
+async def test_wipo_v3():
+    """Teste standalone"""
+    print("🧪 Testing WIPO Crawler V3...")
     print("=" * 60)
     
-    # Test search
     results = await search_wipo_patents(
         molecule="darolutamide",
         dev_codes=["ODM-201", "BAY-1841788"],
-        max_results=10
+        max_results=5,
+        headless=True
     )
     
     print(f"\n✅ Retrieved {len(results)} patents")
     
     if results:
-        print("\n📄 Sample patent:")
-        sample = results[0]
-        print(json.dumps(sample, indent=2)[:500])
-        
-    return results
+        print("\n📄 First patent sample:")
+        import json
+        print(json.dumps(results[0], indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    # Test standalone
-    asyncio.run(test_wipo_crawler())
+    asyncio.run(test_wipo_v3())
